@@ -513,7 +513,7 @@ class Worker(threading.Thread):
                 short_name = "{0}.{1}".format(schema, table)
 
                 # --- RETRY LOOP ---
-                max_retries = 3
+                max_retries = 1
                 for attempt in range(max_retries):
                     try:
                         self.tracker.update_worker_status(self.name, "[BUSY] {0} (Try {1}/{2})".format(short_name, attempt+1, max_retries))
@@ -547,6 +547,12 @@ class Worker(threading.Thread):
                                             insert_logic_dict[current_col] = match.group(2)
                                         elif current_col:
                                             insert_logic_dict[current_col] += " \n" + line
+
+                                for col in insert_logic_dict:
+                                    logic = insert_logic_dict[col]
+                                    logic = logic.replace('\\n', ' ').replace('\n', ' ')
+                                    logic = re.sub(r'(?i)\s+AS\s+"?[a-zA-Z0-9_]+"?(?:\s*)$', '', logic)
+                                    insert_logic_dict[col] = logic.strip()
                             except Exception as e:
                                 self.logger.warning("Worker {0} error reading logic file {1}: {2}".format(self.name, il_file, e))
 
