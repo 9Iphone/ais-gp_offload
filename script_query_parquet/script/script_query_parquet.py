@@ -699,6 +699,31 @@ class Worker(threading.Thread):
         except Exception as e:
             return False, str(e)
 
+    def _check_manual_num(self, master_info, type_map):
+        self.logger.info("DEBUG: master_info = {0}".format(master_info))
+        new_master_info = {'manual_num': []}
+        manual_num_err = []
+        
+        for col in master_info.get('manual_num', []):
+            lookup_col = col.strip().lower()
+            datatype = type_map.get(lookup_col)
+            if datatype is None:
+                err_msg = "Column: {0} is not found in data type file".format(col)
+                self.logger.error("[{0}] {1}".format(self.name, err_msg))
+                manual_num_err.append(err_msg)
+                continue
+            
+            base_datatype = datatype.split('(')[0].strip().lower()
+            if base_datatype in ['bigint', 'integer', 'int']:
+                new_master_info['manual_num'].append(col)
+            else:
+                err_msg = "Column: {0} is NOT bigint or integer (data type = {1})".format(col, datatype)
+                self.logger.error("[{0}] {1}".format(self.name, err_msg))
+                manual_num_err.append(err_msg)
+                
+        self.logger.info("DEBUG: new_master_info = {0}".format(new_master_info))
+        return new_master_info, manual_num_err
+
     def run(self):
         while(True):
             if self.abort_event.is_set():
@@ -744,31 +769,15 @@ class Worker(threading.Thread):
                 type_map = type_map or {}
 
                 master_info = self.config.master_data.get((db, schema, base_table), {'manual_num': []})
+                
                 ### Check if user's manual input column exists in table ###
-                self.logger.info(master_info)
-                not_found_list = []
-                mismatch_dtype = {}
-                new_manual_col = []
+                manual_num_err = []
+                new_master_info = {'manual_num': []}
                 if not missing_meta: 
-                    # Column not found : [], Datatype mismatch : {'col1':{'expect':'int', 'actual':'bigint'},}
-                    dtype_pattern = r'^(int|integer|bigint)$'
-                    for m_col in master_info['manual_num']:
-                        if m_col not in type_map:
-                            not_found_list.append(m_col)
-                        elif m_col in type_map:
-                            actual_type = type_map[m_col]
-                            if not re.match(dtype_pattern, actual_type, re.IGNORECASE):
-                                mismatch_dtype[m_col] = actual_type
-                            elif re.match(dtype_pattern, actual_type, re.IGNORECASE):
-                                new_manual_col.append(m_col)
-                if len(not_found_list) > 0:
-                    self.logger.error("List of manual column not found on GP table: {0}".format(not_found_list))
-                if len(mismatch_dtype) > 0:
-                    self.logger.error("Datatype mismatch, Expect all manual column datatype to be int or bigint, Got : {0}".format(mismatch_dtype))
-                self.logger.info("Validated column list {0}".format(new_manual_col))
+                    new_master_info, manual_num_err = self._check_manual_num(master_info, type_map)
                 
                 cat_cols = {'SUM_MIN_MAX': [], 'MIN_MAX': [], 'MD5_MIN_MAX': [], 'TYPE_MAP': type_map, 
-                            'MANUAL_NUM': new_manual_col}
+                            'MANUAL_NUM': new_master_info['manual_num']}
                 ### ======================================================================= ###
                 thai_config = self.config.thai_dict.get((db.lower(), partition.lower()), {})
                 if not thai_config:
@@ -873,17 +882,12 @@ class Worker(threading.Thread):
 
                 # Step 6: Finalize Status
                 duration = time.time() - start_t
-                status = "WARNING" if missing_meta else "SUCCESS"
+                status = "FAILED" if missing_meta else "SUCCESS"
                 remark = "Metadata Missing (Count-only)" if missing_meta else "JSON Generated"
 
-                if len(not_found_list) > 0 or len(mismatch_dtype) > 0:
-                    status = "WARNING"
-                    warn_msgs = []
-                    if len(not_found_list) > 0:
-                        warn_msgs.append("Manual col not found: {0}".format(not_found_list))
-                    if len(mismatch_dtype) > 0:
-                        warn_msgs.append("Mismatch dtype: {0}".format(mismatch_dtype))
-                    remark = "{0} | {1}".format(remark, " | ".join(warn_msgs))
+                if manual_num_err:
+                    status = "FAILED"
+                    remark = "{0} | {1}".format(remark, ",".join(manual_num_err))
                 
                 self.tracker.add_result(partition, status, duration, remark)
                 self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), duration, status.lower(), remark)
