@@ -216,7 +216,13 @@ class ConfigManager(object):
             for t in tables:
                 try:
                     db_part, tbl_part = t.split('|')
-                    self.execution_list.append({'db': db_part.strip(), 'partition': tbl_part.strip()})
+                    sch_part, real_tbl = tbl_part.split('.')
+                    if db_part and sch_part and real_tbl:
+                        self.execution_list.append({
+                            'db': db_part.strip(),
+                            'schema': sch_part.strip(),
+                            'partition': real_tbl.strip()
+                        })
                 except ValueError:
                     self.logger.error("Invalid format in argument: {0}. Expected DB|Schema.Partition".format(t))
         else:
@@ -250,8 +256,8 @@ class ConfigManager(object):
 
         # 4. Load Shared Master Config
         self.master_data = {}
-        target_master_path = getattr(self, 'master_file_path', '') or master_config_path
-        self.logger.info("Loading config_master (Shared): {0}".format(master_config_path))
+        target_master_path = master_config_path if master_config_path else getattr(self, 'master_file_path', '')
+        self.logger.info("Loading config_master (Shared): {0}".format(target_master_path))
         try:
             with open(target_master_path, 'r') as f:
                 reader = csv.reader(f, delimiter='|')
@@ -264,7 +270,6 @@ class ConfigManager(object):
         except Exception as e:
             self.logger.error("Failed to load master config: {0}".format(e))
             raise
-
         # 5. Load Shared Data Type Mapping
         self.type_mapping = {"SUM_MIN_MAX": [], "MIN_MAX": [], "MD5_MIN_MAX": []}
         target_map_path = getattr(self, 'mapping_file_path', '') or map_config_path
@@ -707,6 +712,7 @@ class Worker(threading.Thread):
 
                 master_info = self.config.master_data.get((db, schema, base_table), {'manual_num': []})
                 ### Check if user's manual input column exists in table ###
+                self.logger.info(master_info)
                 if not missing_meta: 
                     # Column not found : [], Datatype mismatch : {'col1':{'expect':'int', 'actual':'bigint'},}
                     not_found_list = []
@@ -722,11 +728,10 @@ class Worker(threading.Thread):
                                 mismatch_dtype[m_col] = actual_type
                             elif re.match(dtype_pattern, actual_type, re.IGNORECASE):
                                 new_manual_col.append(m_col)
-
                 if len(not_found_list) > 0:
-                    self.logger.warning("List of manual column not found on GP table: {0}".format(not_found_list))
+                    self.logger.error("List of manual column not found on GP table: {0}".format(not_found_list))
                 if len(mismatch_dtype) > 0:
-                    self.logger.warning("Datatype mismatch, Expect all manual column datatype to be int or bigint, Got : {0}".format(mismatch_dtype))
+                    self.logger.error("Datatype mismatch, Expect all manual column datatype to be int or bigint, Got : {0}".format(mismatch_dtype))
                 self.logger.info("Validated column list {0}".format(new_manual_col))
                 
                 cat_cols = {'SUM_MIN_MAX': [], 'MIN_MAX': [], 'MD5_MIN_MAX': [], 'TYPE_MAP': type_map, 
@@ -956,11 +961,15 @@ if __name__ == "__main__":
     parser.add_argument('--concurrency', default=4, type=int)
     args = parser.parse_args()
 
-    args.env = os.path.join(main_path, 'config', os.path.basename(args.env))
-    args.master = os.path.join(main_path, 'config', os.path.basename(args.master))
-    args.map = os.path.join(main_path, 'config', os.path.basename(args.map))
-    args.list = os.path.join(main_path, 'config', os.path.basename(args.list))
+    def resolve_config_path(input_path, base_dir):
+        if os.path.isabs(input_path):
+            return input_path
+        return os.path.join(base_dir, 'config', input_path)
 
+    args.env = resolve_config_path(args.env, main_path)
+    args.master = resolve_config_path(args.master, main_path)
+    args.map = resolve_config_path(args.map, main_path)
+    args.list = resolve_config_path(args.list, main_path)
     run_datetime = datetime.now()
     global_date_folder = run_datetime.strftime("%Y%m%d")
     global_ts = run_datetime.strftime("%Y%m%d_%H%M%S")
