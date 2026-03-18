@@ -258,6 +258,10 @@ class ConfigManager(object):
                 self.logger.critical("Cannot find list_table file: {0}".format(e))
                 raise
 
+        if not self.execution_list and not self.invalid_tables:
+            self.logger.critical("CRITICAL_FAILED: Input table list is empty. Please provide valid tables via --table_name or list file.")
+            raise ValueError("Input table list is empty or contains no rows.")
+
         # 3. Export and Load Thai Mapping via subprocess psql
         if self.gp_db and self.thai_mapping_table and self.thai_mapping_export_path:
             if not self._export_thai_mapping():
@@ -549,7 +553,7 @@ class LogParser(object):
 
                 if not matched_files:
                     self.logger.critical("[LogParser] Log files not found for pattern: {0}.".format(search_pattern))
-                    raise RuntimeError("FAIL_FAST: Log files not found for pattern: {0}".format(search_pattern))
+                    raise RuntimeError("CRITICAL_FAILED: Log files not found for pattern: {0}".format(search_pattern))
                 else:
                     expected_fields = [
                         "Run_ID", "Greenplum_Tbl", "Hive_Tbl", 
@@ -944,8 +948,8 @@ class Worker(threading.Thread):
                 self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, e))
                 self.tracker.add_result(partition, "FAILED", time.time() - start_t, "Error: {0}".format(err_msg[:50]))
                 self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, "failed", err_msg[:200])
-                if "FAIL_FAST:" in err_msg:
-                    self.logger.critical("Worker {0} signaling global abort due to FAIL_FAST condition.".format(self.name))
+                if "CRITICAL_FAILED:" in err_msg:
+                    self.logger.critical("Worker {0} signaling global abort due to CRITICAL_FAILED condition.".format(self.name))
                     self.abort_event.set()
                     break
             finally:
