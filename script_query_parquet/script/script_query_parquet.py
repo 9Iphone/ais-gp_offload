@@ -80,7 +80,7 @@ class ProcessTracker(object):
                 if len(r['table']) > max_w_table: max_w_table = len(r['table'])
                 if len(r['status']) > max_w_status: max_w_status = len(r['status'])
 
-                if r['status'] == 'COMPLETED': success_count += 1
+                if r['status'] == 'SUCCESS': success_count += 1
                 elif r['status'] == 'WARNING': warning_count += 1
                 elif r['status'] == 'FAILED': failed_count += 1
                 elif r['status'] == 'SKIPPED': skipped_count +=1
@@ -104,7 +104,7 @@ class ProcessTracker(object):
                 ))
             
             self.logger.info(sep_line)
-            self.logger.info("Total: {0} | Completed: {1} | Warning: {2} | Failed: {3} | Skipped: {4}".format(
+            self.logger.info("Total: {0} | Success: {1} | Warning: {2} | Failed: {3} | Skipped: {4}".format(
                 len(self.results), success_count, warning_count, failed_count, skipped_count
             ))
             self.logger.info("Total Execution Time: {0:.2f}s".format(time.time() - self.start_time))
@@ -113,7 +113,7 @@ class ProcessTracker(object):
         # summary_file = os.path.join(output_path, "reconcile_summary_{0}.txt".format(datetime.now().strftime("%Y%m%d_%H%M%S")))
         # try:
         #     with open(summary_file, 'w') as f:
-        #         f.write("Total: {0}\nCompleted: {1}\nFailed: {2}\nSkipped: {3}\n".format(
+        #         f.write("Total: {0}\nSuccess: {1}\nFailed: {2}\nSkipped: {3}\n".format(
         #             len(self.results), success_count, failed_count, skipped_count))
         # except Exception as e:
         #     self.logger.error("Could not write summary file to output: {0}".format(e))
@@ -123,7 +123,7 @@ class ProcessTracker(object):
         print("FINAL SUMMARY REPORT")
         print("="*80)
         print("Total    : {0}".format(len(self.results)))
-        print("Completed: {0}".format(success_count))
+        print("Success  : {0}".format(success_count))
         print("Warning  : {0}".format(warning_count))
         print("Failed   : {0}".format(failed_count))
         print("Skipped  : {0}".format(skipped_count))
@@ -210,6 +210,7 @@ class ConfigManager(object):
 
         # 2. Load Target Tables (Moved up before Thai mapping logic to build IN clause)
         self.execution_list = []
+        self.invalid_tables = []
         if cli_tables:
             self.logger.info("Using CLI arguments for table list.")
             tables = cli_tables.split(',')
@@ -223,8 +224,13 @@ class ConfigManager(object):
                             'schema': sch_part.strip(),
                             'partition': real_tbl.strip()
                         })
+                    else:
+                        self.logger.error("Invalid format in argument: {0}. Expected DB|Schema.Table".format(t))
+                        self.invalid_tables.append({'table': t.strip(), 'reason': "Invalid format in argument: Expected DB|Schema.Table"})
+                        continue
                 except ValueError:
-                    self.logger.error("Invalid format in argument: {0}. Expected DB|Schema.Partition".format(t))
+                    self.logger.error("Invalid format in argument: {0}. Expected DB|Schema.Table".format(t))
+                    self.invalid_tables.append({'table': t.strip(), 'reason': "Invalid format in argument: Expected DB|Schema.Table"})
         else:
             self.logger.info("Using list file: {0}".format(list_file_path))
             try:
@@ -235,13 +241,19 @@ class ConfigManager(object):
                         try:
                             db_part, tbl_part = line.split('|')
                             sch_part, real_tbl = tbl_part.split('.')
-                            self.execution_list.append({
-                                'db': db_part.strip(), 
-                                'schema': sch_part.strip(), 
-                                'partition': real_tbl.strip()
-                            })
+                            if db_part and sch_part and real_tbl:
+                                self.execution_list.append({
+                                    'db': db_part.strip(),
+                                    'schema': sch_part.strip(),
+                                    'partition': real_tbl.strip()
+                                })
+                            else:
+                                self.logger.error("Skipping invalid line in list file: {0}. Expected DB|Schema.Table".format(line))
+                                self.invalid_tables.append({'table': line, 'reason': "Invalid format in list file: Expected DB|Schema.Table"})
+                                continue
                         except ValueError:
-                            self.logger.warning("Skipping invalid line in list file: {0}".format(line))
+                            self.logger.warning("Skipping invalid line in list file: {0}. Expected DB|Schema.Table".format(line))
+                            self.invalid_tables.append({'table': line, 'reason': "Invalid format in list file: Expected DB|Schema.Table"})
             except IOError as e:
                 self.logger.critical("Cannot find list_table file: {0}".format(e))
                 raise
@@ -256,20 +268,36 @@ class ConfigManager(object):
 
         # 4. Load Shared Master Config
         self.master_data = {}
-        target_master_path = master_config_path if master_config_path else getattr(self, 'master_file_path', '')
+        
+        target_master_path = None
+        if master_config_path:
+            target_master_path = master_config_path
+            pass
+        elif getattr(self, 'master_file_path', ''):
+            target_master_path = getattr(self, 'master_file_path', '')
+            pass
+        else:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            target_master_path = os.path.join(base_dir, 'config', 'config_master.txt')
+            pass
+
         self.logger.info("Loading config_master (Shared): {0}".format(target_master_path))
-        try:
-            with open(target_master_path, 'r') as f:
-                reader = csv.reader(f, delimiter='|')
-                for line in reader:
-                    if len(line) < 4: continue
-                    db, sch, tbl, m_num = [x.strip() for x in line[:4]]
-                    self.master_data[(db, sch, tbl)] = {
-                        'manual_num': [x.strip().lower() for x in m_num.split(',') if x.strip().lower() != 'none' and x.strip()]
-                    }
-        except Exception as e:
-            self.logger.error("Failed to load master config: {0}".format(e))
-            raise
+        if os.path.isfile(target_master_path):
+            try:
+                with open(target_master_path, 'r') as f:
+                    reader = csv.reader(f, delimiter='|')
+                    for line in reader:
+                        if len(line) < 4: continue
+                        db, sch, tbl, m_num = [x.strip() for x in line[:4]]
+                        self.master_data[(db, sch, tbl)] = {
+                            'manual_num': [x.strip().lower() for x in m_num.split(',') if x.strip().lower() != 'none' and x.strip()]
+                        }
+            except Exception as e:
+                self.logger.error("Failed to load master config: {0}".format(e))
+                raise
+        else:
+            self.logger.warning("Target config_master file not found: {0}.".format(target_master_path))
+
         # 5. Load Shared Data Type Mapping
         self.type_mapping = {"SUM_MIN_MAX": [], "MIN_MAX": [], "MD5_MIN_MAX": []}
         target_map_path = getattr(self, 'mapping_file_path', '') or map_config_path
@@ -472,14 +500,15 @@ class LogParser(object):
                 self.logger.info("[LogParser] Building memory cache for DB: {0}, Schema: {1} ...".format(db, schema))
                 self.cache[cache_key] = {}
                 
-                # search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat.{0}.csv".format(schema))
-                search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
+                search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat.{0}.csv".format(schema))
+                # search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
                 # search_pattern = os.path.join(self.succeed_base_path, db, "backup_old_file", "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
                 self.logger.info("[LogParser] Searching for succeed log using pattern: {0}".format(search_pattern))
                 matched_files = sorted(glob.glob(search_pattern), reverse=True)
 
                 if not matched_files:
-                    self.logger.warning("[LogParser] Log files not found for pattern: {0}".format(search_pattern))
+                    self.logger.critical("[LogParser] Log files not found for pattern: {0}.".format(search_pattern))
+                    raise RuntimeError("FAIL_FAST: Log files not found for pattern: {0}".format(search_pattern))
                 else:
                     expected_fields = [
                         "Run_ID", "Greenplum_Tbl", "Hive_Tbl", 
@@ -522,8 +551,8 @@ class LogParser(object):
                 partition, latest_row.get('File_Path', 'N/A')))
             return latest_row, "Found SUCCEEDED record"
         elif latest_row and latest_row.get('Run_Status') == 'FAILED':
-            self.logger.warning("[LogParser] Skip table {0}. Latest Run_Status=FAILED.".format(target_table_with_schema))
-            return None, "Latest Run_Status=FAILED"
+            self.logger.warning("[LogParser] Skip table {0}. Latest Export status is not SUCCEEDED.".format(target_table_with_schema))
+            return None, "Latest Export status is not SUCCEEDED"
         else:
             self.logger.warning("[LogParser] Status is not SUCCEEDED in cache for {0}".format(partition))
             return None, "Status is not SUCCEEDED in any log files"
@@ -631,7 +660,7 @@ class HiveLogger(object):
 # ==============================================================================
 
 class Worker(threading.Thread):
-    def __init__(self, thread_id, job_queue, config, log_parser, hdfs_h, meta_fetcher, query_builder, hive_logger, spark, tracker, logger, execution_id, global_ts, out_path):
+    def __init__(self, thread_id, job_queue, config, log_parser, hdfs_h, meta_fetcher, query_builder, hive_logger, spark, tracker, logger, execution_id, global_ts, out_path, abort_event):
         threading.Thread.__init__(self)
         self.thread_id = thread_id
         self.name = "Worker-{0:02d}".format(thread_id)
@@ -648,6 +677,7 @@ class Worker(threading.Thread):
         self.execution_id = execution_id
         self.global_ts = global_ts
         self.out_path = out_path
+        self.abort_event = abort_event
         self.daemon = True
 
     def _copy_file_to_nas(self, local_file_path, db, schema, target_file_name):
@@ -671,6 +701,9 @@ class Worker(threading.Thread):
 
     def run(self):
         while(True):
+            if self.abort_event.is_set():
+                break
+
             try:
                 task = self.queue.get(block=True, timeout=2)
             except Queue.Empty:
@@ -691,7 +724,7 @@ class Worker(threading.Thread):
                 # Step 1: Check Succeed Log
                 log_row, log_msg = self.log_parser.get_latest_succeed_info(db, schema, partition)
                 if not log_row:
-                    raise ValueError("SKIPPED: " + log_msg)
+                    raise ValueError(log_msg)
                 
                 local_file_path = log_row.get('File_Path')
                 if self.config.replace_path_from and self.config.replace_path_to:
@@ -713,11 +746,11 @@ class Worker(threading.Thread):
                 master_info = self.config.master_data.get((db, schema, base_table), {'manual_num': []})
                 ### Check if user's manual input column exists in table ###
                 self.logger.info(master_info)
+                not_found_list = []
+                mismatch_dtype = {}
+                new_manual_col = []
                 if not missing_meta: 
                     # Column not found : [], Datatype mismatch : {'col1':{'expect':'int', 'actual':'bigint'},}
-                    not_found_list = []
-                    mismatch_dtype = {}
-                    new_manual_col = []
                     dtype_pattern = r'^(int|integer|bigint)$'
                     for m_col in master_info['manual_num']:
                         if m_col not in type_map:
@@ -756,10 +789,28 @@ class Worker(threading.Thread):
                 # Step 4: Build & Execute SparkSQL Expressions
                 self.spark.sparkContext.setJobGroup(partition, "Query: " + partition)
                 df = self.spark.read.parquet(hdfs_dest)
+                # FOR DEBUG
+                # self.logger.info("Total rows in raw parquet (count action): {}".format(df.count()))
+                # self.logger.info("Raw Parquet Schema:")
+                # df.printSchema()
                 agg_exprs = self.query_builder.build_agg_exprs(cat_cols)
                 
                 self.logger.info("Worker {0} executing Spark Action for {1}...".format(self.name, partition))
+                # FOR DEBUG
+                # failure_found = False
+                # for expr in agg_exprs:
+                #     try:
+                #         self.logger.info("Testing expr: {}".format(expr))
+                #         df.agg(expr).collect() 
+                #     except Exception as inner_e:
+                #         self.logger.error("FAULTY EXPRESSION FOUND: {} \nError: {}".format(expr, str(inner_e)))
+                #         failure_found = True
+                #         break
+
+                # if failure_found:
+                #     raise RuntimeError("Aborting due to bad SQL expression.")
                 sp_row = df.agg(*agg_exprs).collect()[0]
+                
                 sp_res = sp_row.asDict()
                 self.spark.sparkContext.setLocalProperty("spark.jobGroup.id", None)
 
@@ -793,6 +844,7 @@ class Worker(threading.Thread):
                         final_json["methods"][method] = collections.OrderedDict()
                         for col in sorted(parsed_res[method].keys()):
                             final_json["methods"][method][col] = collections.OrderedDict()
+                            final_json["methods"][method][col]["data_type"] = type_map.get(col, "unknown")
                             for f in ["sum", "min", "max", "min_md5", "max_md5"]:
                                 if f in parsed_res[method][col]:
                                     final_json["methods"][method][col][f] = parsed_res[method][col][f]
@@ -823,6 +875,15 @@ class Worker(threading.Thread):
                 duration = time.time() - start_t
                 status = "WARNING" if missing_meta else "SUCCESS"
                 remark = "Metadata Missing (Count-only)" if missing_meta else "JSON Generated"
+
+                if len(not_found_list) > 0 or len(mismatch_dtype) > 0:
+                    status = "WARNING"
+                    warn_msgs = []
+                    if len(not_found_list) > 0:
+                        warn_msgs.append("Manual col not found: {0}".format(not_found_list))
+                    if len(mismatch_dtype) > 0:
+                        warn_msgs.append("Mismatch dtype: {0}".format(mismatch_dtype))
+                    remark = "{0} | {1}".format(remark, " | ".join(warn_msgs))
                 
                 self.tracker.add_result(partition, status, duration, remark)
                 self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), duration, status.lower(), remark)
@@ -834,9 +895,14 @@ class Worker(threading.Thread):
                 self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, status.lower(), msg)
             except Exception as e:
                 err_msg = str(e)
-                self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, repr(e)))
+                # self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, repr(e)))
+                self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, e))
                 self.tracker.add_result(partition, "FAILED", time.time() - start_t, "Error: {0}".format(err_msg[:50]))
                 self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, "failed", err_msg[:200])
+                if "FAIL_FAST:" in err_msg:
+                    self.logger.critical("Worker {0} signaling global abort due to FAIL_FAST condition.".format(self.name))
+                    self.abort_event.set()
+                    break
             finally:
                 self.queue.task_done()
 
@@ -907,6 +973,10 @@ class ParquetQueryJob(object):
 
         self.config = ConfigManager(args.env, args.master, args.map, args.list, args.table_name, logger, self.global_date_folder)
 
+        if not os.path.exists(self.config.succeed_path):
+            self.logger.critical("Configured succeed_path does not exist: {0}".format(self.config.succeed_path))
+            raise RuntimeError("Missing or invalid succeed_path directory.")
+
         self.logger.info("Initializing SparkSession with FAIR scheduler...")
         self.spark = SparkSession.builder.appName("script_reconcile_query_parquet") \
             .config("spark.scheduler.mode", "FAIR").enableHiveSupport().getOrCreate()
@@ -921,15 +991,19 @@ class ParquetQueryJob(object):
         self.hive_logger = HiveLogger(self.spark, logger)
 
         self.job_queue = Queue.Queue()
+        self.abort_event = threading.Event()
         for task in self.config.execution_list: self.job_queue.put(task)
-        self.tracker.set_total_task(len(self.config.execution_list))
+        self.tracker.set_total_task(len(self.config.execution_list) + len(self.config.invalid_tables))
+
+        for invalid_node in self.config.invalid_tables:
+            self.tracker.add_result(invalid_node['table'], "FAILED", 0.0, invalid_node['reason'])
 
     def run(self):
         num_workers = int(self.args.concurrency)
         workers = []
         for i in range(num_workers):
             w = Worker(i+1, self.job_queue, self.config, self.log_parser, self.hdfs_h, self.meta_fetcher, 
-                       self.query_builder, self.hive_logger, self.spark, self.tracker, self.logger, self.execution_id, self.global_ts, self.out_path)
+                       self.query_builder, self.hive_logger, self.spark, self.tracker, self.logger, self.execution_id, self.global_ts, self.out_path, self.abort_event)
             workers.append(w)
             w.start()
 
@@ -937,6 +1011,14 @@ class ParquetQueryJob(object):
         monitor.start()
 
         try:
+            while not self.job_queue.empty():
+                if self.abort_event.is_set():
+                    break
+                time.sleep(1)
+            
+            if self.abort_event.is_set():
+                raise RuntimeError("Script aborted due to critical worker failure (e.g. Missing config).")
+            
             self.job_queue.join()
             for w in workers: w.join()
         except KeyboardInterrupt:
@@ -954,7 +1036,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Parquet JSON Query Builder')
     parser.add_argument('--env', default='env_config.txt')
-    parser.add_argument('--master', default='config_master.txt')
+    parser.add_argument('--master', help='Override config_master_file_path defined in env_config')
     parser.add_argument('--map', default='data_type_mapping.json')
     parser.add_argument('--list', default='list_table.txt')
     parser.add_argument('--table_name', help='Specific tables to run (DB|Schema.Partition)')
@@ -962,12 +1044,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     def resolve_config_path(input_path, base_dir):
+        if not input_path: return input_path
         if os.path.isabs(input_path):
             return input_path
         return os.path.join(base_dir, 'config', input_path)
 
     args.env = resolve_config_path(args.env, main_path)
-    args.master = resolve_config_path(args.master, main_path)
+    if args.master is not None:
+        args.master = resolve_config_path(args.master, main_path)
     args.map = resolve_config_path(args.map, main_path)
     args.list = resolve_config_path(args.list, main_path)
     run_datetime = datetime.now()
