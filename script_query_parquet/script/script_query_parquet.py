@@ -110,13 +110,13 @@ class ProcessTracker(object):
             self.logger.info("Total Execution Time: {0:.2f}s".format(time.time() - self.start_time))
 
         # Write summary to output directory
-        summary_file = os.path.join(output_path, "reconcile_summary_{0}.txt".format(datetime.now().strftime("%Y%m%d_%H%M%S")))
-        try:
-            with open(summary_file, 'w') as f:
-                f.write("Total: {0}\nCompleted: {1}\nFailed: {2}\nSkipped: {3}\n".format(
-                    len(self.results), success_count, failed_count, skipped_count))
-        except Exception as e:
-            self.logger.error("Could not write summary file to output: {0}".format(e))
+        # summary_file = os.path.join(output_path, "reconcile_summary_{0}.txt".format(datetime.now().strftime("%Y%m%d_%H%M%S")))
+        # try:
+        #     with open(summary_file, 'w') as f:
+        #         f.write("Total: {0}\nCompleted: {1}\nFailed: {2}\nSkipped: {3}\n".format(
+        #             len(self.results), success_count, failed_count, skipped_count))
+        # except Exception as e:
+        #     self.logger.error("Could not write summary file to output: {0}".format(e))
 
         # Print Summary to Console
         print("\n" + "="*80)
@@ -128,7 +128,7 @@ class ProcessTracker(object):
         print("Failed   : {0}".format(failed_count))
         print("Skipped  : {0}".format(skipped_count))
         print("Log File : {0}".format(log_path))
-        print("Output   : {0}".format(summary_file))
+        # print("Output   : {0}".format(summary_file))
         print("="*80)
 
 def setup_logging(log_dir, log_name="app", timestamp=None):
@@ -274,7 +274,18 @@ class ConfigManager(object):
                 self.type_mapping = json.load(f)
         except Exception as e:
             self.logger.error("Failed to load JSON mapping: {0}".format(e))
-
+        #### Check if datatype duplicate between method ####
+        repeat_data_type = (
+            (set(self.type_mapping['SUM_MIN_MAX']) & set(self.type_mapping['MIN_MAX'])) |
+            (set(self.type_mapping['SUM_MIN_MAX']) & set(self.type_mapping['MD5_MIN_MAX'])) |
+            (set(self.type_mapping['MIN_MAX']) & set(self.type_mapping['MD5_MIN_MAX']))
+        )
+        if repeat_data_type:
+            str_repeat_data_type = ", ".join(sorted(repeat_data_type))
+            self.logger.error("Mapping file has repeat datatype: '{0}' in many method.".format(str_repeat_data_type))
+            raise
+        else:
+            self.logger.info("Loading data_type_mapping (Shared): SUCCESS.")
     def _export_thai_mapping(self):
         target_tables = set(["{0}.{1}".format(t['schema'], t['partition']) for t in self.execution_list])
         if not target_tables:
@@ -456,6 +467,7 @@ class LogParser(object):
                 self.logger.info("[LogParser] Building memory cache for DB: {0}, Schema: {1} ...".format(db, schema))
                 self.cache[cache_key] = {}
                 
+                # search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat.{0}.csv".format(schema))
                 search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
                 # search_pattern = os.path.join(self.succeed_base_path, db, "backup_old_file", "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
                 self.logger.info("[LogParser] Searching for succeed log using pattern: {0}".format(search_pattern))
@@ -499,11 +511,14 @@ class LogParser(object):
         target_table_with_schema = "{0}.{1}".format(schema, partition)
         
         latest_row = self.cache[cache_key].get(partition) or self.cache[cache_key].get(target_table_with_schema)
-        
-        if latest_row:
+        # self.logger.info(latest_row)
+        if latest_row and latest_row.get('Run_Status') == 'SUCCEEDED':
             self.logger.info("[LogParser] Found latest SUCCEEDED record for {0} from Cache. Target Parquet: {1}".format(
                 partition, latest_row.get('File_Path', 'N/A')))
             return latest_row, "Found SUCCEEDED record"
+        elif latest_row and latest_row.get('Run_Status') == 'FAILED':
+            self.logger.warning("[LogParser] Skip table {0}. Latest Run_Status=FAILED.".format(target_table_with_schema))
+            return None, "Latest Run_Status=FAILED"
         else:
             self.logger.warning("[LogParser] Status is not SUCCEEDED in cache for {0}".format(partition))
             return None, "Status is not SUCCEEDED in any log files"
@@ -692,8 +707,35 @@ class Worker(threading.Thread):
                 type_map = type_map or {}
 
                 master_info = self.config.master_data.get((db, schema, base_table), {'manual_num': []})
+                ### Check if user's manual input column exists in table ###
+                if not missing_meta: 
+                    # Column not found : [], Datatype mismatch : {'col1':{'expect':'int', 'actual':'bigint'},}
+                    not_found_list = []
+                    mismatch_dtype = {}
+                    new_manual_col = []
+                    dtype_pattern = r'^(int|integer|bigint)$'
+                    for m_col in master_info['manual_num']:
+                        if m_col not in type_map:
+                            not_found_list.append(m_col)
+                        elif m_col in type_map:
+                            actual_type = type_map[m_col]
+                            if not re.match(dtype_pattern, actual_type, re.IGNORECASE):
+                                mismatch_dtype[m_col] = {
+                                    'expect_on_gp': 'integer/bigint', 
+                                    'actual_on_gp': actual_type
+                                }
+                            elif re.match(dtype_pattern, actual_type, re.IGNORECASE):
+                                new_manual_col.append(m_col)
+
+                if len(not_found_list) > 0:
+                    self.logger.warning("List of manual column not found on GP table: {0}".format(not_found_list))
+                if len(mismatch_dtype) > 0:
+                    self.logger.warning("Datatype mismatch, Expect all manual column datatype to be int or bigint, Got : {0}".format(mismatch_dtype))
+                self.logger.info("Final manual column list {0}".format(new_manual_col))
+                
                 cat_cols = {'SUM_MIN_MAX': [], 'MIN_MAX': [], 'MD5_MIN_MAX': [], 'TYPE_MAP': type_map, 
-                            'MANUAL_NUM': master_info['manual_num']}
+                            'MANUAL_NUM': new_manual_col}
+                ### ======================================================================= ###
                 thai_config = self.config.thai_dict.get((db.lower(), partition.lower()), {})
                 if not thai_config:
                     thai_config = self.config.thai_dict.get((db.lower(), base_table.lower()), {})                
@@ -732,6 +774,7 @@ class Worker(threading.Thread):
                 
                 final_json = collections.OrderedDict()
                 final_json["table"] = "{0}.{1}.{2}".format(db, schema, partition)
+                final_json["source_type"] = "parquet"
                 final_json["count"] = int(sp_res.pop("count", 0))
                 final_json["methods"] = collections.OrderedDict()
                 
