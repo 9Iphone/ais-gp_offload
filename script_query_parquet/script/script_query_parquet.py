@@ -420,25 +420,66 @@ class SparkQueryBuilder(object):
                 agg_func, col, p, s, r
             )
 
-    def _build_date_expr(self, agg_func, col, gp_type):
-        """ REQ 5.2: Date/Time Type with Regex and Named Struct logic """
-        # Step 1: Base Regex Cleansing (Handles year > 9999 and 24:00:00)
-        clean_str = "regexp_replace(regexp_replace(CAST(`{0}` AS STRING), '^[0-9]{{5,}}-', '9999-'), '24:00:00', '23:59:59')".format(col)
+    # def _build_date_expr(self, agg_func, col, gp_type):
+    #     """ REQ 5.2: Date/Time Type with Regex and Named Struct logic """
+    #     # Step 1: Base Regex Cleansing (Handles year > 9999 and 24:00:00)
+    #     clean_str = "regexp_replace(regexp_replace(CAST(`{0}` AS STRING), '^[0-9]{{5,}}-', '9999-'), '24:00:00', '23:59:59')".format(col)
 
-        # Step 2: Specific Data Type Parsing (Determine Timestamp Format)
+    #     # Step 2: Specific Data Type Parsing (Determine Timestamp Format)
+    #     ts_parse = ""
+    #     gp_base = gp_type.split('(')[0].strip().lower()
+    #     if 'timestamp' in gp_base:
+    #         ts_parse = "CASE WHEN `{0}` LIKE '% BC' THEN to_timestamp({1}, 'yyyy-MM-dd HH:mm:ss G') ELSE to_timestamp({1}) END".format(col, clean_str)
+    #     elif 'date' in gp_base:
+    #         ts_parse = "CASE WHEN `{0}` LIKE '% BC' THEN to_timestamp({1}, 'yyyy-MM-dd G') ELSE to_timestamp({1}, 'yyyy-MM-dd') END".format(col, clean_str)
+    #     elif 'time' in gp_base:
+    #         ts_parse = "to_timestamp(concat('1970-01-01 ', {0}))".format(clean_str)
+    #     else:
+    #         ts_parse = "to_timestamp({0})".format(clean_str)
+
+    #     # Step 3: Build Struct for Aggregation
+    #     struct_expr = "CASE WHEN {0} IS NULL THEN NULL ELSE named_struct('ts', {0}, 'val', CAST(`{1}` AS STRING)) END".format(ts_parse, col)
+
+    #     # Step 4: Extract Aggregated Value
+    #     return "{0}({1}).val".format(agg_func, struct_expr)
+    
+    def _build_date_expr(self, agg_func, col, gp_type):
+        # Step 1: Base Regex Cleansing
+        clean_str = "CAST(`{0}` AS STRING)".format(col)
+        clean_str = "regexp_replace({0}, '^[0-9]{{5,}}-', '9999-')".format(clean_str)
+        clean_str = "regexp_replace({0}, '24:00:00', '23:59:59')".format(clean_str)
+        clean_str = "regexp_replace({0}, '([+-][0-9]{{2}}:[0-9]{{2}}):[0-9]{{2}}', '$1')".format(clean_str)
+
+        # Step 2: Specific Data Type Parsing
         ts_parse = ""
         gp_base = gp_type.split('(')[0].strip().lower()
-        if 'timestamp' in gp_base:
-            ts_parse = "CASE WHEN `{0}` LIKE '% BC' THEN to_timestamp({1}, 'yyyy-MM-dd HH:mm:ss G') ELSE to_timestamp({1}) END".format(col, clean_str)
-        elif 'date' in gp_base:
+        
+        if gp_base == "timestamp with time zone":
+            bc_clean = "regexp_replace({0}, '[+-][0-9]{{2}}(:[0-9]{{2}})? BC$', ' BC')".format(clean_str)
+            ts_parse = "CASE WHEN `{0}` LIKE '% BC' THEN to_timestamp({1}, 'yyyy-MM-dd HH:mm:ss G') ELSE to_timestamp({2}, 'yyyy-MM-dd HH:mm:ssX') END".format(col, bc_clean, clean_str)
+            
+        elif gp_base in ("timestamp without time zone", "timestamp"):
+            ts_parse = "CASE WHEN `{0}` LIKE '% BC' THEN to_timestamp({1}, 'yyyy-MM-dd HH:mm:ss G') ELSE to_timestamp({1}, 'yyyy-MM-dd HH:mm:ss') END".format(col, clean_str)
+            
+        elif gp_base == "date":
             ts_parse = "CASE WHEN `{0}` LIKE '% BC' THEN to_timestamp({1}, 'yyyy-MM-dd G') ELSE to_timestamp({1}, 'yyyy-MM-dd') END".format(col, clean_str)
-        elif 'time' in gp_base:
-            ts_parse = "to_timestamp(concat('1970-01-01 ', {0}))".format(clean_str)
+            
+        elif gp_base == "time with time zone":
+            clean_str = "concat('1970-01-01 ', {0})".format(clean_str)
+            ts_parse = "to_timestamp({0}, 'yyyy-MM-dd HH:mm:ssX')".format(clean_str)
+            
+        elif gp_base == "time without time zone":
+            clean_str = "concat('1970-01-01 ', {0})".format(clean_str)
+            ts_parse = "to_timestamp({0}, 'yyyy-MM-dd HH:mm:ss')".format(clean_str)
         else:
             ts_parse = "to_timestamp({0})".format(clean_str)
 
-        # Step 3: Build Struct for Aggregation
-        struct_expr = "CASE WHEN {0} IS NULL THEN NULL ELSE named_struct('ts', {0}, 'val', CAST(`{1}` AS STRING)) END".format(ts_parse, col)
+        # Step 3: Build Struct for Aggregation (Add 'yr' for safe extreme date sorting)
+        if gp_base in ("time with time zone", "time without time zone"):
+            struct_expr = "CASE WHEN {0} IS NOT NULL THEN named_struct('ts', {0}, 'val', CAST(`{1}` AS STRING)) END".format(ts_parse, col)
+        else:
+            year_expr = "CAST(regexp_extract(CAST(`{0}` AS STRING), '^([0-9]+)-', 1) AS BIGINT) * CASE WHEN CAST(`{0}` AS STRING) LIKE '% BC' THEN -1 ELSE 1 END".format(col)
+            struct_expr = "CASE WHEN {0} IS NOT NULL THEN named_struct('yr', {2}, 'ts', {0}, 'val', CAST(`{1}` AS STRING)) END".format(ts_parse, col, year_expr)
 
         # Step 4: Extract Aggregated Value
         return "{0}({1}).val".format(agg_func, struct_expr)
