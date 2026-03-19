@@ -913,6 +913,8 @@ class Worker(threading.Thread):
         #self.status = status
 
         remark = "-" if status.upper() == "SUCCESS" else remark
+        statused = "SUCCEEDED" if status.upper() == "SUCCESS" else status
+
 
         # 2. Directory creation with Race Condition handling
         if not os.path.exists(status_dir):
@@ -945,7 +947,7 @@ class Worker(threading.Thread):
         json_output_path = getattr(self, "local_json_file", "")
         reconcile_method = getattr(self, "reconcile_method", [])
         self.logger.info("[{0}] Retrieved attributes for logging. Short Name: {1}, Start TS: {2}, Status: {3}".format(
-            self.name, short_name, start_ts, status
+            self.name, short_name, start_ts, statused
         ))
 
         # 5. Timing & Duration calculation
@@ -973,7 +975,7 @@ class Worker(threading.Thread):
             start_ts, end_ts, 
             duration_str, 
             reconcile_method_str, 
-            status, 
+            statused, 
             remark, 
             json_output_path, 
             "" # remark
