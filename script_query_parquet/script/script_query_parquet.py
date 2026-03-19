@@ -173,7 +173,7 @@ class ConfigManager(object):
         self.thai_mapping_table = ''
         self.thai_mapping_export_path = ''
         self.thai_dict = {}
-
+        
         self.local_temp_dir = os.path.join(main_path, 'output')
         #self.nas_dest_base = os.path.join(main_path, 'output')
         #self.log_dir = os.path.join(main_path, 'log')
