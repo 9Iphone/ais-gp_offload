@@ -913,7 +913,7 @@ class Worker(threading.Thread):
         #self.status = status
 
         remark = "-" if status.upper() == "SUCCESS" else remark
-
+        status = "SUCCEEDED" if status.upper() == "SUCCESS" else status
         # 2. Directory creation with Race Condition handling
         if not os.path.exists(status_dir):
             try:
@@ -1185,17 +1185,46 @@ class Worker(threading.Thread):
                 with open(self.local_json_file, 'w') as f:
                     json.dump(final_json, f)
 
+                # Copy both files to NAS
                 copy_success, copy_err = self._copy_file_to_nas(self.local_json_file, db, schema, out_file_name)
+                # copy_sql_success, copy_sql_err = self._copy_file_to_nas(local_query_file, db, schema, query_file_name)
                 
-                if copy_success:
-                    self.logger.info("Worker {0} successfully saved local files and copied JSON to NAS for {1}".format(self.name, partition))
-                else:
-                    raise RuntimeError("Failed to copy file to NAS: {0}".format(copy_err))
+                # Check actual existence on NAS
+                nas_dir = os.path.join(self.config.nas_destination, db, schema)
+                nas_json_path = os.path.join(nas_dir, out_file_name)
+                # nas_sql_path = os.path.join(nas_dir, query_file_name)
+                
+                json_exists = os.path.exists(nas_json_path)
+                # sql_exists = os.path.exists(nas_sql_path)
 
+                # if copy_success and copy_sql_success and json_exists and sql_exists:
+                #     self.logger.info("Worker {0} successfully saved and copied both JSON and SQL to NAS for {1}".format(self.name, partition))
+                # else:
+                #     self.logger.error("Worker {0} failed NAS sync for {1}. JSON Err: {2} | SQL Err: {3}".format(
+                #         self.name, partition, copy_err, copy_sql_err))
+                if copy_success and json_exists:
+                    self.logger.info("Worker {0} successfully saved and copied JSON to NAS for {1}".format(self.name, partition))
+                else:
+                    self.logger.error("Worker {0} failed NAS sync for {1}. JSON Err: {2}".format(
+                        self.name, partition, copy_err))
                 # Step 6: Finalize Status
                 duration = time.time() - start_t
-                status = "FAILED" if missing_meta else "SUCCESS"
-                remark = "Metadata Missing (Count-only)" if missing_meta else "JSON Generated"
+                
+                # if copy_success and copy_sql_success and json_exists and sql_exists:
+                if copy_success and json_exists:
+                    status = "SUCCESS"
+                    remark = "JSON Generated."
+                else:
+                    status = "FAILED"
+                    err_remarks = []
+                    if not copy_success: err_remarks.append("JSON Copy Error ({0})".format(copy_err))
+                    if not json_exists: err_remarks.append("JSON Not Found on NAS")
+                    # if not copy_sql_success: err_remarks.append("SQL Copy Error ({0})".format(copy_sql_err))
+                    # if not sql_exists: err_remarks.append("SQL Not Found on NAS")
+                    remark = " | ".join(err_remarks)
+
+                if missing_meta:
+                    remark = "Metadata Missing (Count-only) | " + remark
 
                 if manual_num_err:
                     status = "FAILED"
