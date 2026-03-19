@@ -913,6 +913,8 @@ class Worker(threading.Thread):
         #self.status = status
 
         remark = "-" if status.upper() == "SUCCESS" else remark
+        statused = "SUCCEEDED" if status.upper() == "SUCCESS" else status
+
 
         # 2. Directory creation with Race Condition handling
         if not os.path.exists(status_dir):
@@ -945,7 +947,7 @@ class Worker(threading.Thread):
         json_output_path = getattr(self, "local_json_file", "")
         reconcile_method = getattr(self, "reconcile_method", [])
         self.logger.info("[{0}] Retrieved attributes for logging. Short Name: {1}, Start TS: {2}, Status: {3}".format(
-            self.name, short_name, start_ts, status
+            self.name, short_name, start_ts, statused
         ))
 
         # 5. Timing & Duration calculation
@@ -973,7 +975,7 @@ class Worker(threading.Thread):
             start_ts, end_ts, 
             duration_str, 
             reconcile_method_str, 
-            status, 
+            statused, 
             remark, 
             json_output_path, 
             "" # remark
@@ -1372,6 +1374,7 @@ class ParquetQueryJob(object):
 
                     #/xx/xx/xx/mig_reconcile_query_gp_output/YYYYMMDD/{db}/{schema}}/stat_csv
                     dest_path = os.path.join(self.config.nas_destination, rel, 'stat_csv')
+                    #self.logger.info("Copying {0} to NAS path: {1}".format(f, dest_path))
                     self.file_h.copy_to_nas(f, dest_path)
 
                 self.logger.info("Copy Stat file = {0} file(s) to NAS successfully".format(len(files)))
