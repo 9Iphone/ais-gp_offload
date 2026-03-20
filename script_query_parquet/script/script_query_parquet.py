@@ -146,7 +146,11 @@ def setup_logging(log_dir, log_name="app", timestamp=None):
     logger.setLevel(logging.INFO)
     logger.handlers = []
     formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-    fh = logging.FileHandler(log_file)
+    try:
+        fh = logging.FileHandler(log_file)
+    except IOError as e:
+        print("CRITICAL: Cannot write to log file '{0}'. Permission denied or disk full. {1}".format(log_file, e))
+        sys.exit(1)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     return logger, log_file
@@ -169,6 +173,9 @@ class ConfigManager(object):
         self.replace_path_to = ''
         self.metadata_base_dir = ''
         self.datatype_mapping_path = ''
+        self.nas_destination = ''  # Default to prevent AttributeError if missing from env_config
+        self.mapping_file_path = ''
+        self.master_file_path = ''
         self.gp_db = ''
         self.thai_mapping_table = ''
         self.thai_mapping_export_path = ''
@@ -360,7 +367,7 @@ class ConfigManager(object):
         if repeat_data_type:
             str_repeat_data_type = ", ".join(sorted(repeat_data_type))
             self.logger.error("Mapping file has repeat datatype: '{0}' in many method.".format(str_repeat_data_type))
-            raise
+            raise ValueError("Mapping file has duplicate datatype across methods: {0}".format(str_repeat_data_type))
         else:
             self.logger.info("Loading data_type_mapping (Shared): SUCCESS.")
     def _export_thai_mapping(self):
@@ -385,9 +392,13 @@ class ConfigManager(object):
         filename = "query_export_thai_mapping_{0}_{1}.sql".format(self.global_ts, self.run_id)
         filepath = os.path.join(self.thai_mapping_export_path, filename)
 
-        with open(filepath, 'w') as f:
-            f.write(sql_query)
-            f.write("\n")
+        try:
+            with open(filepath, 'w') as f:
+                f.write(sql_query)
+                f.write("\n")
+        except IOError as e:
+            self.logger.error("Failed to write SQL file for Thai mapping: {0}".format(e))
+            return False
 
         self.logger.info("Generated SQL for Thai Mapping: {0}".format(filepath))
         cmd = ['psql', '-v', 'ON_ERROR_STOP=1', '-d', self.gp_db, '-f', filepath]
@@ -706,10 +717,15 @@ class HDFSHandler(object):
         self.logger = logger
         self.spark = spark_session
 
-        self.sc = self.spark.sparkContext
-        self.hadoop_conf = self.sc._jsc.hadoopConfiguration()
-        self.fs = self.sc._jvm.org.apache.hadoop.fs.FileSystem.get(self.hadoop_conf)
-        self.Path = self.sc._jvm.org.apache.hadoop.fs.Path
+        # JVM filesystem init can fail if Kerberos ticket expired or Hadoop config missing
+        try:
+            self.sc = self.spark.sparkContext
+            self.hadoop_conf = self.sc._jsc.hadoopConfiguration()
+            self.fs = self.sc._jvm.org.apache.hadoop.fs.FileSystem.get(self.hadoop_conf)
+            self.Path = self.sc._jvm.org.apache.hadoop.fs.Path
+        except Exception as e:
+            self.logger.critical("CRITICAL_FAILED: Cannot initialize HDFS via JVM bridge: {0}".format(e))
+            raise RuntimeError("CRITICAL_FAILED: HDFS JVM initialization failed: {0}".format(e))
 
     def sync_parquet(self, local_file_path, hdfs_dest_path):
         self.logger.info("[HDFSHandler] Evaluating HDFS sync. Local: {0} -> HDFS: {1}".format(local_file_path, hdfs_dest_path))
@@ -1059,6 +1075,10 @@ class Worker(threading.Thread):
             #self.status = "PROCESSING"
             self.reconcile_method = ['count']
 
+            status = "FAILED"
+            remark = ""
+            nas_json_path = ""
+
             base_table = partition.split('_1_prt_')[0] if '_1_prt_' in partition else partition
 
             try:
@@ -1143,7 +1163,10 @@ class Worker(threading.Thread):
 
                 # if failure_found:
                 #     raise RuntimeError("Aborting due to bad SQL expression.")
-                sp_row = df.agg(*agg_exprs).collect()[0]
+                agg_result = df.agg(*agg_exprs).collect()
+                if not agg_result:
+                    raise RuntimeError("Spark aggregation returned empty result for {0}".format(partition))
+                sp_row = agg_result[0]
                 
                 sp_res = sp_row.asDict()
                 self.spark.sparkContext.setLocalProperty("spark.jobGroup.id", None)
@@ -1187,16 +1210,22 @@ class Worker(threading.Thread):
                 query_file_name = "query_{0}_{1}_{2}_{3}.sql".format(db, schema, partition, self.global_ts)
                 local_query_file = os.path.join(self.out_path, query_file_name)
                 
-                with open(local_query_file, 'w') as f:
-                    f.write("-- PySpark Aggregation Expressions for {0}\n".format(partition))
-                    for expr in agg_exprs:
-                        f.write(str(expr) + "\n")
+                try:
+                    with open(local_query_file, 'w') as f:
+                        f.write("-- PySpark Aggregation Expressions for {0}\n".format(partition))
+                        for expr in agg_exprs:
+                            f.write(str(expr) + "\n")
+                except IOError as e:
+                    raise IOError("Failed to save local SQL file {0}: {1}".format(local_query_file, e))
 
                 out_file_name = "parquet_{0}_{1}_{2}_{3}.json".format(db, schema, partition, self.global_ts)
                 self.local_json_file = os.path.join(self.out_path, out_file_name)
                 
-                with open(self.local_json_file, 'w') as f:
-                    json.dump(final_json, f)
+                try:
+                    with open(self.local_json_file, 'w') as f:
+                        json.dump(final_json, f)
+                except IOError as e:
+                    raise IOError("Failed to save local JSON output {0}: {1}".format(self.local_json_file, e))
 
                 # Copy both files to NAS
                 copy_success, copy_err = self._copy_file_to_nas(self.local_json_file, db, schema, out_file_name)
@@ -1255,6 +1284,7 @@ class Worker(threading.Thread):
                 #self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, status.lower(), msg)
             except Exception as e:
                 remark = str(e)
+                status = "FAILED"
                 # self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, repr(e)))
                 self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, e))
                 self.tracker.add_result(partition, "FAILED", time.time() - start_t, "Error: {0}".format(remark[:50]))
@@ -1340,15 +1370,19 @@ class ParquetQueryJob(object):
 
         self.config = ConfigManager(args.env, args.master, args.map, args.list, args.table_name, logger, self.global_date_folder, self.run_id, self.global_ts, main_path)
 
-        if not os.path.exists(self.config.succeed_path):
-            self.logger.critical("Configured succeed_path does not exist: {0}".format(self.config.succeed_path))
+        if not self.config.succeed_path or not os.path.exists(self.config.succeed_path):
+            self.logger.critical("Configured succeed_path is empty or does not exist: '{0}'".format(self.config.succeed_path))
             raise RuntimeError("Missing or invalid succeed_path directory.")
 
         self.logger.info("Initializing SparkSession with FAIR scheduler...")
-        self.spark = SparkSession.builder.appName("script_reconcile_query_parquet") \
-            .config("spark.scheduler.mode", "FAIR").enableHiveSupport().getOrCreate()
-        self.spark.sparkContext.setLogLevel("ERROR")
-        self.execution_id = self.spark.sparkContext.applicationId
+        try:
+            self.spark = SparkSession.builder.appName("script_reconcile_query_parquet") \
+                .config("spark.scheduler.mode", "FAIR").enableHiveSupport().getOrCreate()
+            self.spark.sparkContext.setLogLevel("ERROR")
+            self.execution_id = self.spark.sparkContext.applicationId
+        except Exception as e:
+            self.logger.critical("CRITICAL_FAILED: SparkSession initialization failed: {0}".format(e))
+            raise RuntimeError("CRITICAL_FAILED: Cannot create SparkSession: {0}".format(e))
 
         # Init Handlers
         self.log_parser = LogParser(self.config.succeed_path, logger)
